@@ -1,20 +1,6 @@
 use crate::leader_election::{Leader, Round};
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
-/// Wrapper trait for convenience to avoid writing all sequence related traits repeatedly.
-pub trait SequenceTraits<R>: Sequence<R> + Debug + Send + Sync + 'static
-where
-    R: Round,
-{
-}
-
-/// Wrapper trait for convenience to avoid writing all Omni-Paxos state related traits repeatedly.
-pub trait StateTraits<R>: PaxosState<R> + Send + 'static
-where
-    R: Round,
-{
-}
-
 /// An entry in the replicated log.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry<R>
@@ -110,6 +96,9 @@ where
     /// Returns true if the log contains a StopSign or a StopSign already has been decided.
     /// Note that the log could have a StopSign that later gets overwritten, and thus this function might first return true and later false.
     fn stopped(&self) -> bool;
+
+    /// Removes elements up to the given [`idx`] from storage.
+    fn garbage_collect(&mut self, idx: u64);
 }
 
 /// Trait to implement a back-end for the internal state used by an Omni-Paxos replica.
@@ -129,6 +118,12 @@ where
     /// Sets the latest accepted round.
     fn set_accepted_round(&mut self, na: R);
 
+    /// Stores the suffix from the maximum promise.
+    fn set_max_promise_sfx(&mut self, max_promise_sfx: Vec<Entry<R>>);
+
+    /// Returns the stored suffix of the maximum promise. Since this is only used once by the leader in the Prepare phase, it is recommended to return the consumed value.
+    fn get_max_promise_sfx(&mut self) -> Vec<Entry<R>>;
+
     /// Returns the latest round in which entries have been accepted.
     fn get_accepted_round(&self) -> R;
 
@@ -137,6 +132,12 @@ where
 
     /// Returns the round that has been promised.
     fn get_promise(&self) -> R;
+
+    /// Sets the garbage collected index.
+    fn set_gc_idx(&mut self, index: u64);
+
+    /// Returns the garbage collected index.
+    fn get_gc_idx(&self) -> u64;
 }
 
 enum PaxosSequence<R, S>
@@ -320,6 +321,183 @@ where
                 arc_s
             }
             _ => panic!("Storage should already have been stopped!"),
+        }
+    }
+
+    /// Removes elements up to the given [`idx`] from storage.
+    pub fn garbage_collect(&mut self, idx: u64) {
+        match self.sequence {
+            PaxosSequence::Active(ref mut s) => {
+                s.garbage_collect(idx - self.paxos_state.get_gc_idx());
+                self.paxos_state.set_gc_idx(idx);
+            }
+            PaxosSequence::Stopped(_) => {} // todo what to do when paxos is stopped?
+            _ => panic!("Got unexpected intermediate PaxosSequence::None in stopped()"),
+        }
+    }
+
+    /// Returns the garbage collector index from storage.
+    pub fn get_gc_idx(&self) -> u64 {
+        self.paxos_state.get_gc_idx()
+    }
+
+    /// Stores the suffix from the maximum promise.
+    pub fn set_max_promise_sfx(&mut self, max_promise_sfx: Vec<Entry<R>>) {
+        self.paxos_state.set_max_promise_sfx(max_promise_sfx);
+    }
+
+    /// Returns the stored suffix of the maximum promise.
+    pub fn get_max_promise_sfx(&mut self) -> Vec<Entry<R>> {
+        self.paxos_state.get_max_promise_sfx()
+    }
+}
+
+/// A in-memory storage implementation for Paxos.
+pub mod memory_storage {
+    use crate::leader_election::Round;
+    use crate::storage::{Entry, PaxosState, Sequence};
+
+    /// Stores all the accepted entries inside a vector.
+    #[derive(Debug)]
+    pub struct MemorySequence<R>
+    where
+        R: Round,
+    {
+        /// Vector which contains all the logged entries in-memory.
+        sequence: Vec<Entry<R>>,
+    }
+
+    impl<R> Sequence<R> for MemorySequence<R>
+    where
+        R: Round,
+    {
+        fn new() -> Self {
+            MemorySequence { sequence: vec![] }
+        }
+
+        fn new_with_sequence(seq: Vec<Entry<R>>) -> Self {
+            MemorySequence { sequence: seq }
+        }
+
+        fn append_entry(&mut self, entry: Entry<R>) {
+            self.sequence.push(entry);
+        }
+
+        fn append_sequence(&mut self, seq: &mut Vec<Entry<R>>) {
+            self.sequence.append(seq);
+        }
+
+        fn append_on_prefix(&mut self, from_idx: u64, seq: &mut Vec<Entry<R>>) {
+            self.sequence.truncate(from_idx as usize);
+            self.sequence.append(seq);
+        }
+
+        fn get_entries(&self, from: u64, to: u64) -> &[Entry<R>] {
+            match self.sequence.get(from as usize..to as usize) {
+                Some(ents) => ents,
+                None => panic!(
+                    "get_entries out of bounds. From: {}, To: {}, len: {}",
+                    from,
+                    to,
+                    self.sequence.len()
+                ),
+            }
+        }
+
+        fn get_suffix(&self, from: u64) -> Vec<Entry<R>> {
+            match self.sequence.get(from as usize..) {
+                Some(s) => s.to_vec(),
+                None => vec![],
+            }
+        }
+
+        fn get_sequence_len(&self) -> u64 {
+            self.sequence.len() as u64
+        }
+
+        fn stopped(&self) -> bool {
+            match self.sequence.last() {
+                Some(entry) => entry.is_stopsign(),
+                None => false,
+            }
+        }
+
+        fn garbage_collect(&mut self, idx: u64) {
+            self.sequence.drain(0..idx as usize);
+        }
+    }
+
+    /// Stores the state of a paxos replica in-memory.
+    #[derive(Debug)]
+    pub struct MemoryState<R>
+    where
+        R: Round,
+    {
+        /// Last promised round.
+        n_prom: R,
+        /// Last accepted round.
+        acc_round: R,
+        /// Length of the decided sequence.
+        ld: u64,
+        /// Garbage collected index.
+        gc_idx: u64,
+        /// Max promise suffix.
+        max_promise_sfx: Vec<Entry<R>>,
+    }
+
+    impl<R> PaxosState<R> for MemoryState<R>
+    where
+        R: Round,
+    {
+        fn new() -> Self {
+            let r = R::default();
+            MemoryState {
+                n_prom: r.clone(),
+                acc_round: r,
+                ld: 0,
+                gc_idx: 0,
+                max_promise_sfx: vec![],
+            }
+        }
+
+        fn set_promise(&mut self, n_prom: R) {
+            self.n_prom = n_prom;
+        }
+
+        fn set_decided_len(&mut self, ld: u64) {
+            self.ld = ld;
+        }
+
+        fn set_accepted_round(&mut self, na: R) {
+            self.acc_round = na;
+        }
+
+        fn set_max_promise_sfx(&mut self, max_promise_sfx: Vec<Entry<R>>) {
+            self.max_promise_sfx = max_promise_sfx;
+        }
+
+        fn get_max_promise_sfx(&mut self) -> Vec<Entry<R>> {
+            std::mem::take(&mut self.max_promise_sfx)
+        }
+
+        fn get_accepted_round(&self) -> R {
+            self.acc_round.clone()
+        }
+
+        fn get_decided_len(&self) -> u64 {
+            self.ld
+        }
+
+        fn get_promise(&self) -> R {
+            self.n_prom.clone()
+        }
+
+        fn set_gc_idx(&mut self, index: u64) {
+            self.gc_idx = index;
+        }
+
+        fn get_gc_idx(&self) -> u64 {
+            self.gc_idx
         }
     }
 }
