@@ -315,8 +315,8 @@ pub mod ballot_leader_election {
                 let hb_request = HeartbeatRequest::with(self.hb_round);
 
                 self.outgoing.push(BLEMessage::with(
-                    *peer,
                     self.pid,
+                    *peer,
                     HeartbeatMsg::Request(hb_request),
                 ));
             }
