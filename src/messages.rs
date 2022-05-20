@@ -178,8 +178,8 @@ where
     R: Round,
 {
     /// Creates a [`Decide`] message.
-    pub fn with(n: R, ld: u64) -> Self {
-        Decide { n, ld }
+    pub fn with(ld: u64, n: R) -> Self {
+        Decide { ld, n }
     }
 }
 
@@ -202,8 +202,6 @@ where
     Decide(Decide<R>),
     /// Forward client proposals to the leader.
     ProposalForward(Vec<Entry<R>>),
-    GarbageCollect(u64),
-    ForwardGarbageCollect(Option<u64>),
 }
 
 /// A struct for a Paxos message that also includes sender and receiver.

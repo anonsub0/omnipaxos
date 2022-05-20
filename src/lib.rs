@@ -21,5 +21,3 @@ pub mod paxos;
 pub mod storage;
 /// A module containing helper functions and structs.
 mod util;
-/// Holds helpful functions for the user.
-pub mod utils;
